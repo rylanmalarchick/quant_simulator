@@ -1,0 +1,33 @@
+funds:
+  - FXAIX
+  - FUSVX
+  - FSRBX
+  - FDEQX
+  - FSHOX
+  - FSPSX
+  - FSELX
+  - FSCSX
+  - FUSEX
+  - FUSVX
+  - FSPTX
+  - FSDAX
+  - FSPCX
+  - FNCMX
+  - FBMPX
+
+quantum:
+  - IONQ
+  - IBM
+  - NVDA
+  - AMD
+  - MSFT
+  - GOOG
+  - AMZN
+  - HON
+  - QRVO
+  - LSCC
+  - MRVL
+  - KLIC
+  - QBTS
+
+dynamic: []
