@@ -9,9 +9,21 @@ from src.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Confidence thresholds for filtering low-conviction trades
+# Only trade when model is confident (reduces noise, improves win rate)
+CONFIDENCE_THRESHOLD_BUY = 0.60   # Must be >60% confident to buy
+CONFIDENCE_THRESHOLD_SELL = 0.40  # Must be <40% confident to short (i.e., 60%+ confident it will fall)
+
+
 def generate_signals():
     """
-    Generates trading signals.
+    Generates trading signals with confidence filtering.
+    
+    CONFIDENCE FILTERING:
+    - Only generates BUY signals when probability > CONFIDENCE_THRESHOLD_BUY
+    - Only generates SELL signals when probability < CONFIDENCE_THRESHOLD_SELL
+    - Stocks in the "uncertain zone" (40-60%) are skipped entirely
+    - This reduces trading frequency but improves signal quality
     """
     logger.info("Generating signals...")
     config = load_config()
@@ -27,6 +39,7 @@ def generate_signals():
         latest_model_path = max([os.path.join(model_dir, f) for f in os.listdir(model_dir)], key=os.path.getctime)
         with open(latest_model_path, 'rb') as f:
             model = pickle.load(f)
+        logger.info(f"Loaded model: {latest_model_path}")
     except (FileNotFoundError, ValueError):
         logger.error("No model found. Please train a model first.")
         return None
@@ -45,20 +58,38 @@ def generate_signals():
     X = latest_features.drop(['symbol', 'timestamp', 'close'], axis=1)
     probabilities = model.predict_proba(X)[:, 1]
     
-    # Rank and select signals
-    logger.info("Ranking and selecting signals...")
+    # Rank and select signals with confidence filtering
+    logger.info("Ranking and selecting signals (with confidence filtering)...")
     latest_features['buy_prob'] = probabilities
     top_k = config['top_k']
     
-    buy_signals = latest_features.nlargest(top_k, 'buy_prob')
-    sell_signals = latest_features.nsmallest(top_k, 'buy_prob')
+    # Apply confidence filtering
+    high_confidence_buys = latest_features[latest_features['buy_prob'] > CONFIDENCE_THRESHOLD_BUY]
+    high_confidence_sells = latest_features[latest_features['buy_prob'] < CONFIDENCE_THRESHOLD_SELL]
+    
+    # Select top_k from filtered results
+    buy_signals = high_confidence_buys.nlargest(top_k, 'buy_prob')
+    sell_signals = high_confidence_sells.nsmallest(top_k, 'buy_prob')
+    
+    # Log confidence stats
+    total_symbols = len(latest_features)
+    uncertain_count = total_symbols - len(high_confidence_buys) - len(high_confidence_sells)
+    logger.info(f"Confidence filtering: {len(high_confidence_buys)} buys, {len(high_confidence_sells)} sells, {uncertain_count} uncertain (skipped)")
     
     # Log signals
     log_message = f"--- Signals for {datetime.now()} ---\n"
+    log_message += f"Confidence thresholds: BUY>{CONFIDENCE_THRESHOLD_BUY}, SELL<{CONFIDENCE_THRESHOLD_SELL}\n"
+    log_message += f"Filtered: {len(high_confidence_buys)} potential buys, {len(high_confidence_sells)} potential sells\n"
     log_message += "BUY:\n"
-    log_message += buy_signals[['symbol', 'buy_prob']].to_string()
+    if len(buy_signals) > 0:
+        log_message += buy_signals[['symbol', 'buy_prob']].to_string()
+    else:
+        log_message += "  (no high-confidence buy signals)"
     log_message += "\nSELL:\n"
-    log_message += sell_signals[['symbol', 'buy_prob']].to_string()
+    if len(sell_signals) > 0:
+        log_message += sell_signals[['symbol', 'buy_prob']].to_string()
+    else:
+        log_message += "  (no high-confidence sell signals)"
     
     logger.info(log_message)
     

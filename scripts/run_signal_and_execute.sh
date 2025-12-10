@@ -14,4 +14,7 @@ python -m src.cli signal
 echo "--- Executing trades ---"
 python -m src.cli execute
 
+echo "--- Generating dashboard ---"
+python -m src.cli dashboard
+
 echo "--- Intraday trading cycle complete ---"

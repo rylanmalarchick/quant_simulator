@@ -141,10 +141,34 @@ docker-compose.yml
 Dockerfile
 docker/volumes
 
-# Config files
+# Config files with secrets
 config.yaml
 *.yml
 !tickers.yml
+!pytest.ini
 .qtick/
 credentials.ini
 settings.ini
+
+# Environment files with API keys
+.env
+*.env
+!.env.example
+
+# Database with personal trading data
+data.db
+*.db
+
+# Trained models (large files, can be regenerated)
+models/*.pkl
+models/*.joblib
+
+# Dashboard output (generated files)
+dashboard_output/
+
+# Log files
+*.log
+signals.log
+
+# Swing trading module env
+swing/.env

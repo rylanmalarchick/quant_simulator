@@ -18,11 +18,11 @@ def load_tickers():
     with open(tickers_path, 'r') as f:
         tickers = yaml.safe_load(f)
 
-    # Validate the static lists
-    if len(tickers['funds']) != 15:
-        raise ValueError("The 'funds' list in tickers.yml must contain 15 tickers.")
-    if len(tickers['quantum']) != 13:
-        raise ValueError("The 'quantum' list in tickers.yml must contain 13 tickers.")
+    # Validate the static lists (minimum counts, not exact)
+    if len(tickers['funds']) < 1:
+        raise ValueError("The 'funds' list in tickers.yml must contain at least 1 ticker.")
+    if len(tickers['quantum']) < 1:
+        raise ValueError("The 'quantum' list in tickers.yml must contain at least 1 ticker.")
 
     return tickers
 

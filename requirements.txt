@@ -1,0 +1,27 @@
+# quantSim - Quantitative Trading System
+# Core dependencies for the main trading pipeline
+
+# Data ingestion
+yfinance>=0.2.50
+requests>=2.31.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine learning
+lightgbm>=4.0.0
+scikit-learn>=1.3.0
+
+# Execution
+alpaca-trade-api>=3.0.0
+
+# Configuration
+pyyaml>=6.0
+
+# Development & Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Logging (stdlib, no install needed)
+# sqlite3 (stdlib, no install needed)
