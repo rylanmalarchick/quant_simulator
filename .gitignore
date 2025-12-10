@@ -172,3 +172,6 @@ signals.log
 
 # Swing trading module env
 swing/.env
+
+# Crisis cache (generated daily)
+crisis_cache.json

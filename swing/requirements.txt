@@ -1,0 +1,25 @@
+# Swing Trading System Dependencies
+
+# Core
+python-dotenv>=1.0.0
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Data feeds
+yfinance>=0.2.30
+polygon-api-client>=1.12.0
+
+# Broker integration
+alpaca-py>=0.13.0
+
+# Scheduling (for automated trading)
+apscheduler>=3.10.0
+
+# Testing
+pytest>=7.0.0
+pytest-mock>=3.10.0
+pytest-cov>=4.0.0
+
+# Type checking (optional)
+mypy>=1.0.0

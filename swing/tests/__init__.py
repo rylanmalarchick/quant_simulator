@@ -1,0 +1,1 @@
+"""Swing trading tests package."""

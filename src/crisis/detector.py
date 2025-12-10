@@ -48,9 +48,14 @@ from scipy import stats
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import yfinance as yf
+import json
+import os
 from src.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Cache file for crisis score
+CRISIS_CACHE_FILE = os.path.join(os.path.dirname(__file__), '..', '..', 'crisis_cache.json')
 
 
 # Historical crisis periods for comparison
@@ -489,6 +494,90 @@ def run_crisis_check() -> Dict:
     }
 
 
+def save_crisis_cache(result: Dict) -> str:
+    """
+    Save crisis check results to cache file.
+    Converts numpy types to Python types for JSON serialization.
+    """
+    # Convert numpy types to Python types
+    cache_data = {
+        'timestamp': datetime.now().isoformat(),
+        'date': datetime.now().strftime('%Y-%m-%d'),
+        'composite_score': float(result['composite_score']),
+        'levels': result['levels'],
+        'readings': {k: float(v) if pd.notna(v) else None for k, v in result['readings'].items()},
+    }
+    
+    # Determine overall status from composite score
+    score = cache_data['composite_score']
+    if score < 30:
+        cache_data['status'] = 'NORMAL'
+    elif score < 50:
+        cache_data['status'] = 'ELEVATED'
+    elif score < 70:
+        cache_data['status'] = 'HIGH'
+    else:
+        cache_data['status'] = 'CRITICAL'
+    
+    with open(CRISIS_CACHE_FILE, 'w') as f:
+        json.dump(cache_data, f, indent=2)
+    
+    logger.info(f"Crisis cache saved: score={score:.1f}, status={cache_data['status']}")
+    return CRISIS_CACHE_FILE
+
+
+def load_crisis_cache() -> Optional[Dict]:
+    """
+    Load cached crisis data. Returns None if cache is missing or stale (not from today).
+    """
+    try:
+        if not os.path.exists(CRISIS_CACHE_FILE):
+            logger.info("No crisis cache file found")
+            return None
+        
+        with open(CRISIS_CACHE_FILE, 'r') as f:
+            cache_data = json.load(f)
+        
+        # Check if cache is from today
+        cache_date = cache_data.get('date', '')
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        if cache_date != today:
+            logger.info(f"Crisis cache is stale (from {cache_date})")
+            return None
+        
+        logger.info(f"Loaded crisis cache: score={cache_data.get('composite_score', 0):.1f}")
+        return cache_data
+        
+    except Exception as e:
+        logger.error(f"Failed to load crisis cache: {e}")
+        return None
+
+
+def get_crisis_score(force_refresh: bool = False) -> Dict:
+    """
+    Get the crisis score, using cache if available and fresh.
+    
+    Args:
+        force_refresh: If True, always run fresh calculation
+        
+    Returns:
+        Dict with composite_score, status, levels, readings, timestamp
+    """
+    if not force_refresh:
+        cached = load_crisis_cache()
+        if cached:
+            return cached
+    
+    # Run fresh calculation
+    logger.info("Running fresh crisis check...")
+    result = run_crisis_check()
+    save_crisis_cache(result)
+    
+    return load_crisis_cache()
+
+
 if __name__ == '__main__':
     result = run_crisis_check()
     print(result['report'])
+    save_crisis_cache(result)

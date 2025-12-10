@@ -8,6 +8,7 @@ Generates a local HTML dashboard with:
 - Equity curve chart
 - Position allocation pie chart
 - Daily returns histogram
+- Crisis/bubble score indicator
 """
 
 import os
@@ -24,6 +25,9 @@ logger = get_logger(__name__)
 
 # Dashboard output directory
 DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'dashboard_output')
+
+# Crisis cache file
+CRISIS_CACHE_FILE = os.path.join(os.path.dirname(__file__), '..', '..', 'crisis_cache.json')
 
 
 def get_account_data() -> Dict:
@@ -175,6 +179,34 @@ def get_model_metrics() -> Dict:
         return {}
 
 
+def get_crisis_data() -> Dict:
+    """Load cached crisis score data."""
+    try:
+        if not os.path.exists(CRISIS_CACHE_FILE):
+            logger.info("No crisis cache file found")
+            return {
+                'composite_score': 0,
+                'status': 'UNKNOWN',
+                'timestamp': 'N/A',
+                'levels': {},
+                'readings': {},
+            }
+        
+        with open(CRISIS_CACHE_FILE, 'r') as f:
+            data = json.load(f)
+        
+        return data
+    except Exception as e:
+        logger.error(f"Failed to load crisis data: {e}")
+        return {
+            'composite_score': 0,
+            'status': 'ERROR',
+            'timestamp': 'N/A',
+            'levels': {},
+            'readings': {},
+        }
+
+
 def calculate_performance_metrics(account: Dict, history: Dict) -> Dict:
     """Calculate performance metrics."""
     initial_capital = account.get('initial_capital', 100000)
@@ -240,6 +272,7 @@ def generate_html(data: Dict) -> str:
     signals = data.get('signals', {})
     metrics = data.get('metrics', {})
     performance = data.get('performance', {})
+    crisis = data.get('crisis', {})
     
     # Prepare chart data
     equity_labels = json.dumps(history.get('timestamps', []))
@@ -469,6 +502,22 @@ def generate_html(data: Dict) -> str:
             color: #f59e0b;
         }}
         
+        .crisis-normal .stat-value {{
+            color: #22c55e;
+        }}
+        
+        .crisis-elevated .stat-value {{
+            color: #f59e0b;
+        }}
+        
+        .crisis-high .stat-value {{
+            color: #f97316;
+        }}
+        
+        .crisis-critical .stat-value {{
+            color: #ef4444;
+        }}
+        
         .signals-container {{
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -617,6 +666,14 @@ def generate_html(data: Dict) -> str:
                     <div class="stat-item">
                         <div class="stat-value negative">{performance.get('max_drawdown_pct', 0):.1f}%</div>
                         <div class="stat-label">Max Drawdown</div>
+                    </div>
+                    <div class="stat-item crisis-{'normal' if crisis.get('status', 'UNKNOWN') == 'NORMAL' else 'elevated' if crisis.get('status', 'UNKNOWN') == 'ELEVATED' else 'high' if crisis.get('status', 'UNKNOWN') == 'HIGH' else 'critical'}">
+                        <div class="stat-value">{crisis.get('composite_score', 0):.0f}/100</div>
+                        <div class="stat-label">Crisis Score ({crisis.get('status', 'N/A')})</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" style="font-size: 0.9rem;">{crisis.get('date', 'N/A')}</div>
+                        <div class="stat-label">Last Crisis Check</div>
                     </div>
                 </div>
             </div>
@@ -831,6 +888,7 @@ def generate_dashboard() -> str:
     signals = get_latest_signals()
     metrics = get_model_metrics()
     performance = calculate_performance_metrics(account, history)
+    crisis = get_crisis_data()
     
     data = {
         'account': account,
@@ -840,6 +898,7 @@ def generate_dashboard() -> str:
         'signals': signals,
         'metrics': metrics,
         'performance': performance,
+        'crisis': crisis,
     }
     
     # Generate HTML
