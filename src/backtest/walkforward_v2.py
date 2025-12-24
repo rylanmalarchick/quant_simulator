@@ -273,10 +273,27 @@ class Position:
     entry_date: datetime
     conviction: float = 0.5  # Model confidence
     side: str = 'long'
+    high_water_mark: float = 0.0  # For trailing stop
+    
+    def __post_init__(self):
+        if self.high_water_mark == 0.0:
+            self.high_water_mark = self.entry_price
     
     @property
     def cost_basis(self) -> float:
         return self.shares * self.entry_price
+    
+    def update_high_water_mark(self, current_price: float) -> None:
+        """Update the high water mark for trailing stop."""
+        if current_price > self.high_water_mark:
+            self.high_water_mark = current_price
+    
+    def check_trailing_stop(self, current_price: float, trailing_pct: float = 0.08) -> bool:
+        """Check if trailing stop is hit. Returns True if should exit."""
+        if self.high_water_mark <= 0:
+            return False
+        drawdown_from_high = (self.high_water_mark - current_price) / self.high_water_mark
+        return drawdown_from_high >= trailing_pct
 
 
 @dataclass
@@ -876,15 +893,30 @@ class WalkForwardBacktesterV2:
         # Regime tracking for performance
         self.regime_returns = {'bull': [], 'bear': [], 'sideways': []}
         
+        # Risk management settings
+        self.trailing_stop_pct = 0.08  # 8% trailing stop
+        self.hard_stop_pct = 0.10  # 10% hard stop from entry
+        self.bear_position_scale = 0.5  # Scale down positions in bear market
+        self.bear_max_positions = 2  # Max positions in bear market
+        
+        # Inverse ETF for hedging
+        self.hedge_etf = 'SH'  # ProShares Short S&P 500
+        self.hedge_position: Optional[Position] = None
+        self.hedge_target_pct = 0.30  # Target 30% hedge in bear markets
+        
+        # Dynamic universe: ticker first available dates (will be populated during data fetch)
+        self.ticker_first_dates: Dict[str, datetime] = {}
+        self.min_history_days = train_window_days  # Minimum trading days needed before including ticker
+        
         logger.info(f"Initialized WalkForwardBacktesterV2 with GPU={use_gpu}")
     
     def _fetch_data(self) -> None:
         """Fetch all required historical data in parallel."""
         logger.info(f"Fetching data for {len(self.tickers)} tickers using {N_JOBS} threads...")
         
-        # Calculate start date with buffer for training
-        # Need ~1.5x calendar days to get enough trading days (252 trading days ≈ 365 calendar days)
-        data_start = self.start_date - timedelta(days=int(self.train_window_days * 1.5) + 100)
+        # Fetch from earliest possible date to capture all crashes
+        # We'll filter by availability per ticker later
+        data_start = datetime(2007, 1, 1)  # Before 2008 crash
         
         def fetch_ticker(ticker):
             try:
@@ -903,23 +935,32 @@ class WalkForwardBacktesterV2:
                     df.columns = [c.lower() for c in df.columns]
                     df = df.rename(columns={'adj close': 'adj_close'})
                     df = df.set_index('date')
-                    return df
+                    return ticker, df
             except Exception as e:
                 logger.warning(f"Failed to fetch {ticker}: {e}")
-            return None
+            return ticker, None
         
         # Parallel fetch using loky (processes) to avoid yfinance thread-safety issues
         results = Parallel(n_jobs=min(N_JOBS, len(self.tickers)), backend="loky")(
             delayed(fetch_ticker)(ticker) for ticker in self.tickers
         )
         
-        all_data = [r for r in results if r is not None]
+        all_data = []
+        for ticker, df in results:
+            if df is not None:
+                all_data.append(df)
+                # Record first available date for this ticker
+                first_date = df.index.min()
+                if hasattr(first_date, 'to_pydatetime'):
+                    first_date = first_date.to_pydatetime()
+                self.ticker_first_dates[ticker] = first_date
+                logger.info(f"  {ticker}: data from {first_date.strftime('%Y-%m-%d')} ({len(df)} rows)")
         
         if not all_data:
             raise ValueError("No data fetched for any ticker")
         
         self.price_data = pd.concat(all_data)
-        logger.info(f"Fetched {len(self.price_data)} rows of data")
+        logger.info(f"Fetched {len(self.price_data)} total rows of data")
         
         # Fetch SPY and VIX for regime detection
         for benchmark, attr in [('SPY', 'spy_data'), ('^VIX', 'vix_data')]:
@@ -942,6 +983,60 @@ class WalkForwardBacktesterV2:
                 setattr(self, attr, pd.DataFrame())
         
         self.feature_calculator.set_market_data(self.spy_data, self.vix_data)
+        
+        # Log dynamic universe summary
+        logger.info("Dynamic Universe Summary:")
+        for ticker, first_date in sorted(self.ticker_first_dates.items(), key=lambda x: x[1]):
+            logger.info(f"  {ticker}: available from {first_date.strftime('%Y-%m-%d')}")
+        
+        # Fetch hedge ETF (SH - inverse SPY)
+        try:
+            hedge_df = yf.download(
+                self.hedge_etf,
+                start=data_start.strftime('%Y-%m-%d'),
+                end=(self.end_date + timedelta(days=1)).strftime('%Y-%m-%d'),
+                progress=False
+            )
+            if isinstance(hedge_df.columns, pd.MultiIndex):
+                hedge_df.columns = hedge_df.columns.get_level_values(0)
+            hedge_df = hedge_df.reset_index()
+            hedge_df.columns = [c.lower() for c in hedge_df.columns]
+            hedge_df['symbol'] = self.hedge_etf
+            hedge_df = hedge_df.set_index('date')
+            self.hedge_data = hedge_df
+            logger.info(f"Fetched {len(hedge_df)} rows for hedge ETF {self.hedge_etf}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch hedge ETF {self.hedge_etf}: {e}")
+            self.hedge_data = pd.DataFrame()
+    
+    def _get_eligible_tickers(self, as_of_date: datetime) -> List[str]:
+        """
+        Get tickers that have sufficient history as of the given date.
+        
+        A ticker is eligible if:
+        - It has data (exists in ticker_first_dates)
+        - It has at least min_history_days of data before as_of_date
+        
+        This enables dynamic universe where newer IPOs (IONQ, QBTS) are only
+        included once they have enough history for training.
+        """
+        eligible = []
+        for ticker, first_date in self.ticker_first_dates.items():
+            # Calculate trading days available (approximate: calendar days * 252/365)
+            days_available = (as_of_date - first_date).days
+            trading_days_approx = int(days_available * 252 / 365)
+            
+            if trading_days_approx >= self.min_history_days:
+                eligible.append(ticker)
+        
+        return eligible
+    
+    def _get_eligible_price_data(self, as_of_date: datetime) -> pd.DataFrame:
+        """Get price data filtered to only eligible tickers."""
+        eligible = self._get_eligible_tickers(as_of_date)
+        if not eligible:
+            return pd.DataFrame()
+        return self.price_data[self.price_data['symbol'].isin(eligible)]
     
     def _create_training_target(self, features_df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -977,7 +1072,19 @@ class WalkForwardBacktesterV2:
     
     def _train_model(self, as_of_date: datetime) -> None:
         """Train XGBoost model with GPU acceleration."""
-        logger.info(f"Training model as of {as_of_date.strftime('%Y-%m-%d')}...")
+        # Get eligible tickers for this date
+        eligible_tickers = self._get_eligible_tickers(as_of_date)
+        if not eligible_tickers:
+            logger.warning(f"No eligible tickers as of {as_of_date.strftime('%Y-%m-%d')}")
+            return
+        
+        logger.info(f"Training model as of {as_of_date.strftime('%Y-%m-%d')} with {len(eligible_tickers)} tickers: {eligible_tickers}")
+        
+        # Get price data filtered to eligible tickers
+        eligible_data = self._get_eligible_price_data(as_of_date)
+        if eligible_data.empty:
+            logger.warning("No eligible price data for training")
+            return
         
         # Get features for training period
         train_start = as_of_date - timedelta(days=self.train_window_days)
@@ -995,7 +1102,7 @@ class WalkForwardBacktesterV2:
                 day_count += 1
                 if day_count % sample_interval == 0:
                     day_features = self.feature_calculator.calculate_features(
-                        self.price_data, current
+                        eligible_data, current
                     )
                     if not day_features.empty:
                         features_list.append(day_features)
@@ -1056,7 +1163,12 @@ class WalkForwardBacktesterV2:
         if self.model is None:
             return {}
         
-        features = self.feature_calculator.calculate_features(self.price_data, as_of_date)
+        # Only generate signals for eligible tickers
+        eligible_data = self._get_eligible_price_data(as_of_date)
+        if eligible_data.empty:
+            return {}
+        
+        features = self.feature_calculator.calculate_features(eligible_data, as_of_date)
         
         if features.empty:
             return {}
@@ -1113,6 +1225,94 @@ class WalkForwardBacktesterV2:
         if side == 'buy':
             return price * (1 + slip)
         return price * (1 - slip)
+    
+    def _get_hedge_price(self, date: datetime) -> Optional[float]:
+        """Get price for hedge ETF on date."""
+        if not hasattr(self, 'hedge_data') or self.hedge_data.empty:
+            return None
+        try:
+            date_data = self.hedge_data[self.hedge_data.index == date]
+            if not date_data.empty:
+                return float(date_data['close'].iloc[0])
+            # Try nearby dates
+            nearby = self.hedge_data[
+                (self.hedge_data.index >= date - timedelta(days=3)) & 
+                (self.hedge_data.index <= date)
+            ]
+            if not nearby.empty:
+                return float(nearby['close'].iloc[-1])
+        except Exception:
+            pass
+        return None
+    
+    def _manage_hedge_position(self, date: datetime, regime: MarketRegime) -> None:
+        """Manage hedge position based on market regime."""
+        hedge_price = self._get_hedge_price(date)
+        if hedge_price is None:
+            return
+        
+        portfolio_value = self._get_portfolio_value(date)
+        
+        if regime.regime == 'bear':
+            # In bear market, maintain hedge position
+            target_hedge_value = portfolio_value * self.hedge_target_pct
+            
+            if self.hedge_position is None:
+                # Open hedge position
+                shares = int(target_hedge_value / hedge_price)
+                if shares > 0:
+                    exec_price = self._apply_slippage(hedge_price, 'buy')
+                    cost = shares * exec_price + self.commission_per_trade
+                    if cost <= self.cash:
+                        self.cash -= cost
+                        self.hedge_position = Position(
+                            symbol=self.hedge_etf,
+                            shares=shares,
+                            entry_price=exec_price,
+                            entry_date=date,
+                            conviction=1.0,
+                            side='hedge'
+                        )
+                        logger.debug(f"HEDGE BUY {shares} {self.hedge_etf} @ ${exec_price:.2f}")
+            else:
+                # Adjust hedge if needed (rebalance if off by >20%)
+                current_value = self.hedge_position.shares * hedge_price
+                if current_value < target_hedge_value * 0.8:
+                    # Add to hedge
+                    add_value = target_hedge_value - current_value
+                    add_shares = int(add_value / hedge_price)
+                    if add_shares > 0:
+                        exec_price = self._apply_slippage(hedge_price, 'buy')
+                        cost = add_shares * exec_price + self.commission_per_trade
+                        if cost <= self.cash:
+                            self.cash -= cost
+                            self.hedge_position.shares += add_shares
+                            logger.debug(f"HEDGE ADD {add_shares} {self.hedge_etf} @ ${exec_price:.2f}")
+        else:
+            # Not in bear market, close hedge if exists
+            if self.hedge_position is not None:
+                exec_price = self._apply_slippage(hedge_price, 'sell')
+                proceeds = self.hedge_position.shares * exec_price - self.commission_per_trade
+                pnl = proceeds - self.hedge_position.cost_basis
+                
+                # Record as trade
+                self.trades.append(Trade(
+                    symbol=self.hedge_etf,
+                    side='hedge',
+                    shares=self.hedge_position.shares,
+                    entry_price=self.hedge_position.entry_price,
+                    exit_price=exec_price,
+                    entry_date=self.hedge_position.entry_date,
+                    exit_date=date,
+                    pnl=pnl,
+                    pnl_percent=pnl / self.hedge_position.cost_basis,
+                    holding_days=(date - self.hedge_position.entry_date).days,
+                    conviction=1.0
+                ))
+                
+                self.cash += proceeds
+                logger.debug(f"HEDGE CLOSE {self.hedge_position.shares} {self.hedge_etf} @ ${exec_price:.2f}, P&L: ${pnl:.2f}")
+                self.hedge_position = None
     
     def _calculate_position_size(self, conviction: float) -> float:
         """
@@ -1217,6 +1417,14 @@ class WalkForwardBacktesterV2:
             else:
                 positions_value += pos.cost_basis
         
+        # Include hedge position
+        if self.hedge_position is not None:
+            hedge_price = self._get_hedge_price(date)
+            if hedge_price:
+                positions_value += self.hedge_position.shares * hedge_price
+            else:
+                positions_value += self.hedge_position.cost_basis
+        
         return self.cash + positions_value
     
     def run(self) -> WalkForwardResult:
@@ -1238,7 +1446,7 @@ class WalkForwardBacktesterV2:
             if regime.regime == 'bull':
                 return 0.55, 0.35, 0.85  # buy, sell, hold_if_above
             elif regime.regime == 'bear':
-                return 0.70, 0.45, 0.90  # More conservative in bear
+                return 0.85, 0.50, 0.95  # MUCH more conservative in bear - barely trade
             else:
                 return 0.60, 0.40, 0.85  # Sideways: standard
         
@@ -1264,8 +1472,14 @@ class WalkForwardBacktesterV2:
                 **regime.to_dict()
             })
             
+            # Manage hedge position based on regime
+            self._manage_hedge_position(current_date, regime)
+            
             # Get regime-adjusted thresholds
             buy_thresh, sell_thresh, hold_thresh = get_thresholds(regime)
+            
+            # Determine max positions for current regime
+            max_positions = self.bear_max_positions if regime.regime == 'bear' else self.top_k
             
             # Get signals
             signals = self._get_signals(current_date)
@@ -1274,7 +1488,7 @@ class WalkForwardBacktesterV2:
                 # Sort by predicted return (first element of tuple)
                 sorted_signals = sorted(signals.items(), key=lambda x: x[1][0], reverse=True)
                 
-                # Close positions
+                # Close positions - check trailing stops and other exit conditions
                 for symbol in list(self.positions.keys()):
                     if symbol in signals:
                         pred, conviction = signals[symbol]
@@ -1286,31 +1500,51 @@ class WalkForwardBacktesterV2:
                     holding_days = (current_date - pos.entry_date).days
                     
                     should_sell = False
+                    sell_reason = ""
                     
-                    # Sell if: low conviction, or held for 5+ days (target horizon), or stop loss
-                    if conviction < sell_thresh:
-                        should_sell = True
-                    elif holding_days >= self.forward_days:
-                        # Held for target horizon - take profit or cut loss
-                        should_sell = True
-                    elif price:
-                        # Stop loss at 5%
-                        if (price / pos.entry_price - 1) < -0.05:
+                    if price:
+                        # Update high water mark for trailing stop
+                        pos.update_high_water_mark(price)
+                        
+                        # Check trailing stop (8% from high)
+                        if pos.check_trailing_stop(price, self.trailing_stop_pct):
                             should_sell = True
+                            sell_reason = "trailing_stop"
+                        # Check hard stop (10% from entry)
+                        elif (price / pos.entry_price - 1) < -self.hard_stop_pct:
+                            should_sell = True
+                            sell_reason = "hard_stop"
+                        # Sell if conviction dropped
+                        elif conviction < sell_thresh:
+                            should_sell = True
+                            sell_reason = "low_conviction"
+                        # Held for target horizon - take profit or cut loss
+                        elif holding_days >= self.forward_days:
+                            should_sell = True
+                            sell_reason = "horizon_reached"
+                        # Force reduce positions in bear market if we have too many
+                        elif regime.regime == 'bear' and len(self.positions) > max_positions:
+                            should_sell = True
+                            sell_reason = "bear_reduction"
                     
                     if should_sell and price:
+                        logger.debug(f"EXIT {symbol}: {sell_reason}")
                         self._execute_sell(symbol, price, current_date)
                 
                 # Open new positions - prioritize by predicted return
-                open_slots = self.top_k - len(self.positions)
+                # In bear market, scale down position sizes and limit count
+                open_slots = max_positions - len(self.positions)
+                
                 for symbol, (pred, conviction) in sorted_signals[:open_slots * 2]:
-                    if len(self.positions) >= self.top_k:
+                    if len(self.positions) >= max_positions:
                         break
                     
                     if conviction >= buy_thresh and symbol not in self.positions:
                         price = self._get_price(symbol, current_date)
                         if price:
-                            self._execute_buy(symbol, price, current_date, conviction)
+                            # Scale down conviction in bear market for smaller positions
+                            adj_conviction = conviction * self.bear_position_scale if regime.regime == 'bear' else conviction
+                            self._execute_buy(symbol, price, current_date, adj_conviction)
             
             # Record equity
             portfolio_value = self._get_portfolio_value(current_date)
@@ -1330,6 +1564,29 @@ class WalkForwardBacktesterV2:
             price = self._get_price(symbol, final_date)
             if price:
                 self._execute_sell(symbol, price, final_date)
+        
+        # Close hedge position at end
+        if self.hedge_position is not None:
+            hedge_price = self._get_hedge_price(final_date)
+            if hedge_price:
+                exec_price = self._apply_slippage(hedge_price, 'sell')
+                proceeds = self.hedge_position.shares * exec_price - self.commission_per_trade
+                pnl = proceeds - self.hedge_position.cost_basis
+                self.trades.append(Trade(
+                    symbol=self.hedge_etf,
+                    side='hedge',
+                    shares=self.hedge_position.shares,
+                    entry_price=self.hedge_position.entry_price,
+                    exit_price=exec_price,
+                    entry_date=self.hedge_position.entry_date,
+                    exit_date=final_date,
+                    pnl=pnl,
+                    pnl_percent=pnl / self.hedge_position.cost_basis,
+                    holding_days=(final_date - self.hedge_position.entry_date).days,
+                    conviction=1.0
+                ))
+                self.cash += proceeds
+                self.hedge_position = None
         
         # Calculate results
         return self._calculate_results(n_train_periods)
